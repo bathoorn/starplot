@@ -29,4 +29,5 @@ p = MapPlot(
 )
 
 p.plot_horizon() # plot a circle on the map where the horizon is for this (lat, lon)
+p.set_circle_boundary()
 p.export("10_zenith.png", padding=0.2)

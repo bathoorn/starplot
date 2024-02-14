@@ -3,13 +3,15 @@ import warnings
 
 from cartopy import crs as ccrs
 from matplotlib import pyplot as plt
-from matplotlib import path
+from matplotlib import path, patches
+from matplotlib.collections import PatchCollection
 from matplotlib.ticker import FuncFormatter, FixedLocator
 from shapely.geometry.polygon import Polygon
 from shapely import LineString, MultiLineString, MultiPolygon
 from shapely.ops import unary_union, split
 import geopandas as gpd
 import numpy as np
+import math
 
 from skyfield.api import Star
 
@@ -405,6 +407,31 @@ class MapPlot(StarPlot):
                 **style_kwargs,
             )
 
+    def _plot_constellation_lines(self):
+        if not self.style.constellation.line.visible:
+            return
+
+        # ensures constellation lines are straight in all supported projections
+        if self.projection == Projection.MERCATOR:
+            transform = self._plate_carree
+        else:
+            transform = self._geodetic
+
+        constellation_lines = self._read_geo_package(
+            DataFiles.CONSTELLATION_LINES.value
+        )
+
+        if constellation_lines.empty:
+            return
+
+        constellation_lines.plot(
+            ax=self.ax,
+            **self.style.constellation.line.matplot_kwargs(
+                size_multiplier=self._size_multiplier
+            ),
+            transform=transform,
+        )
+
     def plot_constellations(self):
         if not self.style.constellation.line.visible:
             return
@@ -510,11 +537,109 @@ class MapPlot(StarPlot):
         Args:
             style: style of the polygon
         """
+        if self.projection in [Projection.STEREO_NORTH, Projection.STEREO_SOUTH]:
+            location = (12.0, self.lat)
+        else:
+            location = ((self.timescale.gmst - self.lon / 15.0) % 24, self.lat)
         self.plot_circle(
-            ((self.timescale.gmst + self.lon / 15.0) % 24, self.lat),
+            location,
             90,
             style,
         )
+
+    def set_circle_boundary(self):
+        theta = np.linspace(0, 2 * np.pi, 100)
+        center, radius = [0.5, 0.5], 0.5
+        verts = np.vstack([np.sin(theta), np.cos(theta)]).T
+        circle = path.Path(verts * radius + center)
+        self.ax.set_boundary(circle, transform=self.ax.transAxes)
+
+    def plot_calendar(self, s=1):
+        def julian_day(year, month, day, hour=0, minute=0, sec=0):
+            last_julian = 15821209.0
+            first_gregorian = 15821220.0
+            req_date = 10000.0 * year + 100 * month + day
+
+            if month <= 2:
+                month += 12
+                year -= 1
+
+            if req_date <= last_julian:
+                b = -2 + math.floor((year + 4716) / 4) - 1179  # Julian calendar
+            elif req_date >= first_gregorian:
+                b = math.floor(year / 400) - math.floor(year / 100) + math.floor(year / 4)  # Gregorian calendar
+            else:
+                raise IndexError("The requested date never happened")
+
+            jd = 365.0 * year - 679004.0 + 2400000.5 + b + math.floor(30.6001 * (month + 1)) + day
+            day_fraction = (int(hour) + int(minute) / 60.0 + sec / 3600.0) / 24.0
+            return jd + day_fraction
+
+        def theta2024(d):
+            """
+            Convert Julian Day into a rotation angle of the sky about the north celestial pole at midnight,
+            relative to spring equinox.
+
+            :param d:
+                Julian day
+            :return:
+                Rotation angle, 24h with vernal equinox at 0h
+            """
+            angle = (d - julian_day(year=2024, month=3, day=20, hour=4, minute=6, sec=0)) / 365.25 * 360
+            return (270 - angle) % 360
+
+        months = [
+            [31, "JANUARY"],
+            [28, "FEBRUARY"],
+            [31, "MARCH"],
+            [30, "APRIL"],
+            [31, "MAY"],
+            [30, "JUNE"],
+            [31, "JULY"],
+            [31, "AUGUST"],
+            [30, "SEPTEMBER"],
+            [31, "OCTOBER"],
+            [30, "NOVEMBER"],
+            [31, "DECEMBER"]
+        ]
+        cal = []
+        # Write month names around the date scale
+        for mn, (mlen, name) in enumerate(months):
+            # Start tick for January is last day of December
+            if mn == 0:
+                prev_lon = s * theta2024(julian_day(year=2024, month=12, day=31, hour=0, minute=0, sec=0))
+            # Tick mark for the month name (middle of the month)
+            # lon = s * theta2024(julian_day(year=2024, month=mn + 1, day=mlen // 2, hour=12, minute=0, sec=0))
+            # Tick marks for end day of month
+            lon = s * theta2024(julian_day(year=2024, month=mn + 1, day=mlen, hour=0, minute=0, sec=0))
+            # Add month slice to cal
+            if s == 1:
+                # North
+                cal.append((lon, prev_lon))
+            else:
+                # South
+                cal.append((prev_lon, lon))
+
+
+            prev_lon = lon
+
+        for n, (start, end) in enumerate(cal):
+            if n % 2:
+                color = 'lightgrey'
+            else:
+                color = 'grey'
+            p = patches.Wedge(
+                (0.5, 0.5),
+                0.5,
+                start,
+                end,
+                width=0.03,
+                fill=True,
+                zorder=100,
+                transform=self.ax.transAxes,
+                fc=color)
+            self.ax.add_patch(p)
+
 
     def _plot_stars(self):
         stardata = stars.load(self.star_catalog)
@@ -681,12 +806,17 @@ class MapPlot(StarPlot):
             layout="constrained",
         )
         bounds = self._latlon_bounds()
-        center_lon = (bounds[0] + bounds[1]) / 2
+        if self.projection == Projection.STEREO_NORTH:
+            center_lon = 0
+        elif  self.projection == Projection.STEREO_SOUTH:
+            center_lon = 180
+        else:
+            center_lon = (bounds[0] + bounds[1]) / 2
         self._center_lon = center_lon
 
         if self.projection in [Projection.ORTHOGRAPHIC, Projection.STEREOGRAPHIC, Projection.ZENITH]:
             # Calculate LST to shift RA DEC to be in line with current date and time
-            lst = -(360.0 * self.timescale.gmst / 24.0 + self.lon) % 360.0
+            lst = (self.timescale.gmst * -15.0 + self.lon) % 360.0
             self._proj = Projection.crs(self.projection, lon=lst, lat=self.lat)
         else:
             self._proj = Projection.crs(self.projection, center_lon)
@@ -695,13 +825,8 @@ class MapPlot(StarPlot):
 
         if self._is_global_extent():
             if self.projection == Projection.ZENITH:
-                theta = np.linspace(0, 2 * np.pi, 100)
-                center, radius = [0.5, 0.5], 0.5
-                verts = np.vstack([np.sin(theta), np.cos(theta)]).T
-                circle = path.Path(verts * radius + center)
                 extent = self.ax.get_extent(crs=self._proj)
                 self.ax.set_extent((p/3.75 for p in extent), crs=self._proj)
-                self.ax.set_boundary(circle, transform=self.ax.transAxes)
             else:
                 # this cartopy function works better for setting global extents
                 self.ax.set_global()
@@ -713,7 +838,7 @@ class MapPlot(StarPlot):
 
         self._plot_gridlines()
         self._plot_tick_marks()
-        # self._plot_constellation_lines()
+        self._plot_constellation_lines()
         self._plot_constellation_borders()
         self._plot_constellation_labels()
         self._plot_stars()
@@ -721,7 +846,7 @@ class MapPlot(StarPlot):
         # New
         self.plot_dsos()
         self.plot_milky_way()
-        self.plot_constellations()
+        # self.plot_constellations()
         # self.plot_constellation_borders()
         self.plot_ecliptic()
         self.plot_celestial_equator()
@@ -729,6 +854,7 @@ class MapPlot(StarPlot):
         self.plot_moon()
 
         self._fit_to_ax()
+        print(f"size {self.fig.get_size_inches()}")
 
         self.refresh_legend()
 
